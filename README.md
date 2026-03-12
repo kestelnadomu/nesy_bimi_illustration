@@ -6,6 +6,6 @@ Bias is a pervasive issue in Machine Learning, particularly in domains like auto
 ### Keywords
 Neurosymbolic AI, Algorithmic Fairness, Bias Mitigation, Trustworthy AI
 
-## [Paper]()
+## [Pre-Print](https://neurosymbolic-ai-journal.com/paper/neurosymbolic-architectures-algorithmic-fairness)
 
-## [Illustration](illustration.qmd)
+## [Illustration](https://kestelnadomu.github.io/nesy_bimi_illustration/)
