@@ -9,6 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
+# Dev settings
+.vscode
+.claude
+
 # Data and Weights
 cache*
+checkpoints*
 *.pth
+
+# Legacy files
+old*

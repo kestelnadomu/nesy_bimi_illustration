@@ -1,13 +1,17 @@
 [project]
 name = "nesy-bimi-illustration"
 version = "0.1.0"
-description = "Add your description here"
+description = "Illustration of a neurosymbolic approach to bias mitigation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "deepproblog>=2.0.6",
     "fairml-datasets>=0.2.5",
-    "ltn>=2.1",
+    "ipykernel>=7.2.0",
+    "nbclient>=0.10.4",
+    "nbformat>=5.10.4",
     "pyaml>=26.2.1",
+    "pyswip>=0.3.3",
     "scikit-learn>=1.7.2",
     "torch>=2.10.0",
     "tqdm>=4.67.3",

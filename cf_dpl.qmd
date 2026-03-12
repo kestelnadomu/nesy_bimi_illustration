@@ -1,0 +1,566 @@
+---
+title: "DeepProbLog Bias Correction on ACSPublicCoverage"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Introduction
+
+This notebook applies **DeepProbLog** to correct for label bias in the
+**ACSPublicCoverage** dataset from the FairGround benchmark collection.
+
+The approach treats observed training labels as noisy: positive labels for
+*privileged* racial groups (White / Asian, RAC1P ∈ {0, 5}) are assumed to be
+over-represented relative to their true probability of public health coverage,
+while the reverse holds for unprivileged groups. A probabilistic logic program
+encodes this bias model, and DeepProbLog composes it with the MLP's neural
+output to produce a de-biased posterior.
+
+**Architecture:**
+
+- `nn(h,[X]) :: y_h(X)` — MLP outputs $P(\hat y = 1 \mid x)$
+- `nn(a,[X]) :: a(X)` — deterministic network reads the RAC1P column and
+  returns $P(\text{privileged} \mid x) \in \{0, 1\}$
+- Probabilistic bias rules adjust for inflated / suppressed labels per group
+- Final predicate `y_(X)` gives the bias-corrected probability
+
+The ProbLog semantics compute the corrected posterior analytically:
+
+$$P(y\_ \mid x) = P(y_h) \cdot P(\neg\text{neg\_bias}) + P(\neg y_h) \cdot P(\text{pos\_bias})$$
+
+---
+
+## Setup
+
+```{python}
+#| label: setup
+#| include: false
+
+import sys
+sys.path.insert(0, ".")
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset as TorchDataset
+from sklearn.metrics import accuracy_score, f1_score
+import matplotlib.pyplot as plt
+
+from problog.logic import Term, Constant
+from deepproblog.dataset import Dataset as DPLDataset
+from deepproblog.engines import ExactEngine
+from deepproblog.evaluate import get_fact_accuracy
+from deepproblog.model import Model as DPLModel
+from deepproblog.network import Network as DPLNetwork
+from deepproblog.query import Query
+
+from fairml_datasets import Dataset as FairDataset
+
+torch.manual_seed(42)
+np.random.seed(42)
+```
+
+---
+
+## Configuration
+
+```{python}
+#| label: config
+
+cfg = {
+    "data": {
+        "dataset_id": "folktables_acspubliccoverage",
+        "test_size": 0.2,
+        "val_size":  0.2,
+    },
+    "model": {
+        "hidden_layer_sizes": [256, 128, 64],
+    },
+    "train": {
+        "batch_size":      512,
+        "baseline_epochs": 100,
+        "lr":              1e-3,
+        "weight_decay":    1e-5,
+        "patience":        15,
+        "checkpoint":      "checkpoints/baseline_dpl.pth",
+    },
+    "dpl": {
+        # Probabilistic bias priors hard-coded in the ProbLog program
+        "neg_bias_privileged":   0.20,  # P(label inflated | privileged)
+        "neg_bias_unprivileged": 0.05,
+        "pos_bias_privileged":   0.05,  # P(label suppressed | privileged)
+        "pos_bias_unprivileged": 0.15,
+        # RAC1P values treated as privileged
+        "privileged_rac1p": {0, 5},     # White (0) and Asian (5)
+        # Number of test samples to evaluate (exact inference is slow)
+        "n_eval": 300,
+    },
+}
+```
+
+---
+
+## Data
+
+```{python}
+#| label: data-loading
+
+dataset = FairDataset.from_id(cfg["data"]["dataset_id"])
+df      = dataset.load()
+df, transform_info = dataset.transform(df)
+
+target_col     = dataset.get_target_column()
+feature_cols   = list(dataset.get_feature_columns(df))
+sensitive_cols = transform_info.sensitive_columns
+
+print(f"Dataset shape    : {df.shape}")
+print(f"Target column    : {target_col}")
+print(f"Sensitive columns: {sensitive_cols}")
+print(f"Features         : {len(feature_cols)}")
+print(f"\nClass distribution:")
+print(df[target_col].value_counts(normalize=True).rename("share").round(3).to_string())
+```
+
+```{python}
+#| label: data-exploration
+
+print("Outcome rate by sensitive group:")
+for col in sensitive_cols:
+    print(f"\n  {col}:")
+    print(df.groupby(col)[target_col].mean().rename("P(y=1)").round(3).to_string())
+```
+
+```{python}
+#| label: data-split
+
+train_df, val_df, test_df = dataset.train_test_val_split(
+    df,
+    test_size=cfg["data"]["test_size"],
+    val_size= cfg["data"]["val_size"],
+)
+print(f"Train: {len(train_df):,}  |  Val: {len(val_df):,}  |  Test: {len(test_df):,}")
+```
+
+```{python}
+#| label: arrays
+
+def df_to_arrays(df, feature_cols, sensitive_cols, target_col):
+    X = df[feature_cols].values.astype(np.float32)
+    A = (df[sensitive_cols[0]].values.astype(np.int64)
+         if sensitive_cols else np.zeros(len(df), dtype=np.int64))
+    y = df[target_col].values.astype(np.float32)
+    return X, A, y
+
+
+X_train, A_train, y_train = df_to_arrays(train_df, feature_cols, sensitive_cols, target_col)
+X_val,   A_val,   y_val   = df_to_arrays(val_df,   feature_cols, sensitive_cols, target_col)
+X_test,  A_test,  y_test  = df_to_arrays(test_df,  feature_cols, sensitive_cols, target_col)
+
+input_dim = X_train.shape[1]
+print(f"Input dimension: {input_dim}")
+```
+
+---
+
+## Baseline MLP
+
+A standard three-hidden-layer MLP trained with binary cross-entropy loss.
+Weights are saved to `{cfg["train"]["checkpoint"]}` so they can be reused
+across experiments without retraining.
+
+```{python}
+#| label: model-def
+
+class TabularDataset(TorchDataset):
+    def __init__(self, X, A, y):
+        self.X = torch.tensor(X)
+        self.A = torch.tensor(A)
+        self.y = torch.tensor(y)
+
+    def __len__(self):  return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.A[idx], self.y[idx]
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_layer_sizes=(256, 128, 64)):
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = input_dim
+        for h in hidden_layer_sizes:
+            layers += [nn.Linear(in_dim, h), nn.ELU()]
+            in_dim = h
+        layers += [nn.Linear(in_dim, 1), nn.Sigmoid()]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+bs     = cfg["train"]["batch_size"]
+
+train_loader = DataLoader(TabularDataset(X_train, A_train, y_train), batch_size=bs, shuffle=True)
+val_loader   = DataLoader(TabularDataset(X_val,   A_val,   y_val),   batch_size=bs)
+test_loader  = DataLoader(TabularDataset(X_test,  A_test,  y_test),  batch_size=bs)
+```
+
+```{python}
+#| label: baseline-train
+
+import os
+
+def train_baseline(model, optimizer, train_loader, val_loader, epochs, patience, ckpt):
+    bce           = nn.BCELoss()
+    best_val_loss = float("inf")
+    no_improve    = 0
+    best_state    = None
+    history       = []
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        for X_b, A_b, y_b in train_loader:
+            X_b, y_b = X_b.to(device), y_b.to(device)
+            optimizer.zero_grad()
+            loss = bce(model(X_b), y_b)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * len(y_b)
+        train_loss /= len(train_loader.dataset)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_b, A_b, y_b in val_loader:
+                X_b, y_b = X_b.to(device), y_b.to(device)
+                val_loss += bce(model(X_b), y_b).item() * len(y_b)
+        val_loss /= len(val_loader.dataset)
+
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1:3d} | train={train_loss:.4f} | val={val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            no_improve    = 0
+            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
+
+    model.load_state_dict(best_state)
+    os.makedirs(os.path.dirname(ckpt), exist_ok=True)
+    torch.save(model.state_dict(), ckpt)
+    return history
+
+
+baseline = MLP(input_dim, tuple(cfg["model"]["hidden_layer_sizes"])).to(device)
+ckpt     = cfg["train"]["checkpoint"]
+
+if os.path.exists(ckpt):
+    print(f"Loading baseline from {ckpt}")
+    baseline.load_state_dict(torch.load(ckpt, map_location=device))
+else:
+    print("=== Training baseline MLP ===")
+    opt_b = optim.AdamW(baseline.parameters(),
+                        lr=cfg["train"]["lr"],
+                        weight_decay=cfg["train"]["weight_decay"])
+    baseline_hist = train_baseline(
+        baseline, opt_b, train_loader, val_loader,
+        epochs=cfg["train"]["baseline_epochs"],
+        patience=cfg["train"]["patience"],
+        ckpt=ckpt,
+    )
+```
+
+```{python}
+#| label: baseline-eval
+
+def evaluate(model, loader, threshold=0.5):
+    model.eval()
+    ys, yps, As = [], [], []
+    with torch.no_grad():
+        for X_b, A_b, y_b in loader:
+            yp = model(X_b.to(device)).cpu()
+            ys.append(y_b); yps.append(yp); As.append(A_b)
+    y    = torch.cat(ys).numpy()
+    prob = torch.cat(yps).numpy()
+    pred = (prob >= threshold).astype(float)
+    a    = torch.cat(As).numpy()
+    return {"accuracy": accuracy_score(y, pred), "f1": f1_score(y, pred, zero_division=0),
+            "prob": prob, "pred": pred, "y": y, "a": a}
+
+
+b_metrics = evaluate(baseline, test_loader)
+print(f"Baseline — accuracy: {b_metrics['accuracy']:.4f}  F1: {b_metrics['f1']:.4f}")
+```
+
+---
+
+## DeepProbLog Bias Model
+
+### Program
+
+The bias program is defined as a string (mirroring `bias.pl` from the project root).
+Both `h` and `a` are declared with the list-input notation `[X]` required by
+DeepProbLog's `term2list` machinery when resolving neural predicates.
+
+```{python}
+#| label: dpl-program
+
+neg_p  = cfg["dpl"]["neg_bias_privileged"]
+neg_up = cfg["dpl"]["neg_bias_unprivileged"]
+pos_p  = cfg["dpl"]["pos_bias_privileged"]
+pos_up = cfg["dpl"]["pos_bias_unprivileged"]
+
+BIAS_PROGRAM = f"""
+nn(h,[X]) :: y_h(X).
+nn(a,[X]) :: a(X).
+
+{neg_p}  :: label_neg_bias(X) :- a(X).
+{neg_up} :: label_neg_bias(X) :- \\+a(X).
+{pos_p}  :: label_pos_bias(X) :- a(X).
+{pos_up} :: label_pos_bias(X) :- \\+a(X).
+
+y_(X) :- y_h(X), \\+label_neg_bias(X).
+y_(X) :- \\+y_h(X), label_pos_bias(X).
+"""
+
+print(BIAS_PROGRAM)
+```
+
+### Networks
+
+```{python}
+#| label: dpl-networks
+
+class ForwardMLPAsProb(nn.Module):
+    """Wraps a [0,1]-output MLP as a DeepProbLog neural fact.
+
+    DeepProbLog interprets the scalar output as P(predicate = true).
+    Input shape: [batch, features].  Output shape: [batch].
+    """
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        self.mlp = mlp
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
+class PrivilegedGroupNet(nn.Module):
+    """Returns P(privileged | x) deterministically from the RAC1P column.
+
+    Outputs 1.0 for White (0) and Asian (5), 0.0 for all other groups.
+    Input shape: [batch, features].  Output shape: [batch].
+    """
+    def __init__(self, col_idx: int, privileged_vals: set):
+        super().__init__()
+        self.col_idx       = col_idx
+        self.privileged_vals = privileged_vals
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attr = x[:, self.col_idx]
+        return torch.tensor(
+            [1.0 if round(float(v)) in self.privileged_vals else 0.0 for v in attr]
+        )
+
+
+rac1p_col    = sensitive_cols[0]
+rac1p_idx    = feature_cols.index(rac1p_col) if rac1p_col in feature_cols else 0
+priv_vals    = cfg["dpl"]["privileged_rac1p"]
+
+print(f"Sensitive column '{rac1p_col}' at feature index {rac1p_idx}")
+print(f"Privileged RAC1P values: {priv_vals}")
+```
+
+### Tensor Source and Dataset
+
+DeepProbLog resolves terms of the form `tensor(src(i))` by calling
+`tensor_source[(Constant(i),)]`, which returns the feature tensor for row `i`.
+
+```{python}
+#| label: dpl-tensor-source
+
+class TabularTensorSource:
+    """Maps Prolog constant indices → feature row tensors.
+
+    Registered via ``model.add_tensor_source(name, source)``.
+    DeepProbLog resolves ``tensor(name(idx))`` as ``source[(Constant(idx),)]``.
+    """
+    def __init__(self, X_array: np.ndarray):
+        self.X = torch.tensor(X_array)
+
+    def __getitem__(self, key: tuple) -> torch.Tensor:
+        return self.X[int(key[0].functor)]   # key = (Constant(i),)
+
+
+class DPLTabularDataset(DPLDataset):
+    """DeepProbLog Dataset for tabular data.
+
+    Queries have the form ``y_(tensor(src_name(idx)))`` with
+    target probability equal to the ground-truth binary label.
+    """
+    def __init__(self, src_name: str, X: np.ndarray, A: np.ndarray, y: np.ndarray):
+        self.src_name = src_name
+        self.X = X
+        self.A = A
+        self.y = y
+
+    def __len__(self) -> int:
+        return len(self.y)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return torch.tensor(self.X[idx])
+
+    def to_query(self, idx: int) -> Query:
+        t = Term("tensor", Term(self.src_name, Constant(idx)))
+        return Query(Term("y_", t), p=float(self.y[idx]))
+```
+
+### Model Assembly and Inference
+
+```{python}
+#| label: dpl-model
+
+# Freeze baseline — inference only
+h_module = ForwardMLPAsProb(baseline)
+for param in h_module.parameters():
+    param.requires_grad_(False)
+h_module.eval()
+
+a_module = PrivilegedGroupNet(rac1p_idx, priv_vals)
+
+h_net = DPLNetwork(h_module, "h", batching=True)
+a_net = DPLNetwork(a_module, "a", batching=True)
+
+dpl_model = DPLModel(BIAS_PROGRAM, [h_net, a_net], load=False)
+dpl_model.set_engine(ExactEngine(dpl_model), cache=True)
+```
+
+```{python}
+#| label: dpl-inference
+
+# Exact inference is per-sample; use a manageable subset
+N    = cfg["dpl"]["n_eval"]
+SRC  = "test_dpl"
+
+test_dpl = DPLTabularDataset(SRC, X_test[:N], A_test[:N], y_test[:N])
+dpl_model.add_tensor_source(SRC, TabularTensorSource(X_test[:N]))
+
+print(f"Running DeepProbLog inference on {N} test samples …")
+dpl_cm = get_fact_accuracy(dpl_model, test_dpl, threshold=0.5, verbose=1)
+```
+
+---
+
+## Evaluation
+
+### Accuracy Comparison
+
+```{python}
+#| label: eval-accuracy
+
+# Baseline on the same subset (fair comparison)
+b_sub = evaluate(baseline, DataLoader(
+    TabularDataset(X_test[:N], A_test[:N], y_test[:N]), batch_size=bs
+))
+
+results = pd.DataFrame({
+    "Model":    ["Baseline", "DPL bias-corrected"],
+    "Accuracy": [f"{b_sub['accuracy']:.4f}", f"{dpl_cm.accuracy():.4f}"],
+})
+print(results.to_string(index=False))
+print()
+print("DPL confusion matrix:")
+print(dpl_cm)
+```
+
+### Per-Group Analysis
+
+```{python}
+#| label: eval-per-group
+
+# Collect DPL corrected predictions
+dpl_preds = []
+dpl_model.eval()
+for i in range(N):
+    q      = test_dpl.to_query(i)
+    answer = dpl_model.solve([q])[0]
+    if answer.result:
+        p = float(answer.result[q.substitute().query])
+    else:
+        p = 0.0
+    dpl_preds.append(p)
+
+dpl_preds  = np.array(dpl_preds)
+dpl_binary = (dpl_preds >= 0.5).astype(float)
+a_sub      = A_test[:N]
+y_sub      = y_test[:N]
+b_prob_sub = b_sub["prob"]
+b_bin_sub  = b_sub["pred"]
+
+print("Per-group positive prediction rate (first {N} test samples):\n")
+print(f"{'Group':>8}  {'n':>6}  {'Baseline':>10}  {'DPL corrected':>14}")
+for g in sorted(np.unique(a_sub)):
+    m = a_sub == g
+    print(f"  {g:6}  {m.sum():6,}  {b_bin_sub[m].mean():10.4f}  {dpl_binary[m].mean():14.4f}")
+```
+
+### Predicted Probability Shift
+
+The bias correction is expected to *lower* predictions for privileged groups
+(RAC1P ∈ {0, 5}) and *raise* them for unprivileged groups.
+
+```{python}
+#| label: eval-shift
+#| fig-width: 11
+#| fig-height: 4
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+colors = plt.cm.tab10.colors
+groups = sorted(np.unique(a_sub))
+
+for ax, probs, title in zip(
+    axes,
+    [b_prob_sub, dpl_preds],
+    ["Baseline", "DPL bias-corrected"],
+):
+    for g, c in zip(groups, colors):
+        m = a_sub == g
+        ax.hist(probs[m], bins=25, alpha=0.5, color=c, label=f"RAC1P={g}", density=True)
+    ax.set_title(title)
+    ax.set_xlabel("P(ŷ = 1)")
+    ax.set_ylabel("Density")
+    ax.legend(fontsize=7, ncol=2)
+
+plt.suptitle("Predicted Probability Distributions by Racial Group", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Summary
+
+The DeepProbLog bias model corrects for assumed label noise by embedding the
+trained MLP inside a probabilistic logic program. Key properties:
+
+- **Transparency**: the correction mechanism is fully explicit in the ProbLog rules;
+  adjusting the bias priors (`neg_bias_*`, `pos_bias_*` in `cfg["dpl"]`) directly
+  changes the de-biased output without retraining the neural network.
+- **Compositionality**: `y_(X)` can be extended with additional ProbLog rules
+  (e.g., causal constraints, domain knowledge) without modifying the MLP.
+- **Trade-off**: accuracy on the test set may decrease because the correction
+  pushes predictions away from the (biased) label distribution on which accuracy
+  is measured; lower accuracy paired with a more equal per-group rate signals that
+  the correction is working.
