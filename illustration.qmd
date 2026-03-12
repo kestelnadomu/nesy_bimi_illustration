@@ -2,6 +2,7 @@
 title: "Neurosymbolic Architectures for Algorithmic Fairness: An Illustration of Counterfactually Fair Logic Tensor Networks"
 format:
   html:
+    output-file: "index.html"
     code-fold: false
     toc: true
     toc-depth: 3
