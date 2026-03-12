@@ -1,0 +1,14 @@
+[project]
+name = "nesy-bimi-illustration"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fairml-datasets>=0.2.5",
+    "ltn>=2.1",
+    "pyaml>=26.2.1",
+    "scikit-learn>=1.7.2",
+    "torch>=2.10.0",
+    "tqdm>=4.67.3",
+]

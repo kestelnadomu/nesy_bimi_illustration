@@ -1,0 +1,29 @@
+data:
+  dataset_id: folktables_acspubliccoverage
+  transform: true
+  val_size: 0.2
+  test_size: 0.2
+
+model:
+  hidden_layer_sizes: [512, 256, 128]
+
+train:
+  loss: equal_opportunity_symbolic
+  epochs: 20
+  batch_size: 1024
+  optimizer: # AdamW
+    lr: 1e-3
+    weight_decay: 1e-4
+  callbacks:
+    patience: 10
+    min_lr: 1e-6
+    checkpoint_path: checkpoints/equal_opportunity_symbolic.pth
+
+eval:
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1_score
+    - tpr_variance
+    - fpr_variance
