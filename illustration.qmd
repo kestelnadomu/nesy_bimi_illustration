@@ -10,7 +10,7 @@ format:
 ---
 
 [[Pre-Print](https://neurosymbolic-ai-journal.com/paper/neurosymbolic-architectures-algorithmic-fairness)
-] [[GitHub Repository](https:/github.com/kestelnadomu/nesy_bimi_illustration)]
+] [[GitHub Repository](https://github.com/kestelnadomu/nesy_bimi_illustration)]
 
 # Introduction
 
